@@ -2,3 +2,12 @@ rembg[cpu]>=2.0.50
 opencv-python>=4.8.0
 numpy>=1.24.0
 Pillow>=10.0.0
+
+# Neural line-art (controlnet-aux LineartDetector). For artist-style strokes
+# matching the project's reference targets. CPU torch is enough.
+# Install with:
+#   uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   uv pip install controlnet-aux
+torch>=2.0
+torchvision>=0.15
+controlnet-aux>=0.0.7

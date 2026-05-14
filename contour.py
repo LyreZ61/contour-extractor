@@ -11,12 +11,25 @@ Pipeline:
 
 import argparse
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image
 from rembg import new_session, remove
+
+# controlnet-aux is the high-quality default — neural line-art that produces
+# smooth, artist-style strokes. Optional: pipeline gracefully falls back to
+# Canny if it isn't installed.
+try:
+    from controlnet_aux import LineartAnimeDetector, LineartDetector  # type: ignore
+
+    _LINEART_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    LineartDetector = None  # type: ignore
+    LineartAnimeDetector = None  # type: ignore
+    _LINEART_AVAILABLE = False
 
 
 def load_image_bgr(path: Path) -> np.ndarray:
@@ -115,6 +128,49 @@ def _canny_edges(gray: np.ndarray, low: int, high: int) -> np.ndarray:
     return cv2.Canny(gray, low, high)
 
 
+@lru_cache(maxsize=2)
+def _lineart_detector(anime: bool):
+    """Cache loaded models per process. Falls back to None if controlnet-aux missing."""
+    if not _LINEART_AVAILABLE:
+        return None
+    cls = LineartAnimeDetector if anime else LineartDetector
+    return cls.from_pretrained("lllyasviel/Annotators")
+
+
+def _neural_lineart(
+    img_bgr: np.ndarray,
+    *,
+    anime: bool,
+    coarse: bool,
+    detect_resolution: int,
+) -> np.ndarray:
+    """Run controlnet-aux line-art model; return uint8 image, strokes = 255.
+
+    The model outputs white-on-black at `detect_resolution`. We rescale back to
+    the input image's resolution and keep the original orientation: stroke=255.
+    """
+    detector = _lineart_detector(anime=anime)
+    if detector is None:
+        raise RuntimeError(
+            "Neural line-art requires 'controlnet-aux' + torch. "
+            "Install with: uv pip install controlnet-aux torch --index-url "
+            "https://download.pytorch.org/whl/cpu — or use --style canny/sketch."
+        )
+    h, w = img_bgr.shape[:2]
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    if anime:
+        out_pil = detector(pil, detect_resolution=detect_resolution, image_resolution=max(w, h))
+    else:
+        out_pil = detector(
+            pil, coarse=coarse, detect_resolution=detect_resolution, image_resolution=max(w, h)
+        )
+    out = np.array(out_pil.convert("L"))
+    if out.shape != (h, w):
+        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_AREA)
+    return out
+
+
 def _xdog_edges(
     gray: np.ndarray,
     sigma: float,
@@ -163,6 +219,8 @@ def inner_edges_layer(
     xdog_epsilon: float,
     xdog_phi: float,
     xdog_normalize: bool,
+    lineart_coarse: bool,
+    lineart_resolution: int,
     binarize_threshold: int,
     clahe_clip: float,
     bilateral_strength: int,
@@ -170,16 +228,25 @@ def inner_edges_layer(
     thickness: int,
     erode: int,
     min_component_size: int,
+    inner_close: int,
 ) -> np.ndarray:
     """Return uint8 binary edge image inside the foreground only.
 
     Output is hard-thresholded: 0 (background) or 255 (stroke). No gradients.
     """
-    gray = _preprocess_gray(img_bgr, clahe_clip, bilateral_strength, flatten)
-
-    if style == "canny":
+    if style in ("lineart", "lineart-anime"):
+        # Neural line-art: skip CLAHE/bilateral (model has own preprocessing)
+        edges = _neural_lineart(
+            img_bgr,
+            anime=(style == "lineart-anime"),
+            coarse=lineart_coarse,
+            detect_resolution=lineart_resolution,
+        )
+    elif style == "canny":
+        gray = _preprocess_gray(img_bgr, clahe_clip, bilateral_strength, flatten)
         edges = _canny_edges(gray, canny_low, canny_high)
     elif style == "sketch":
+        gray = _preprocess_gray(img_bgr, clahe_clip, bilateral_strength, flatten)
         edges = _xdog_edges(
             gray, xdog_sigma, xdog_k, xdog_tau, xdog_epsilon, xdog_phi, xdog_normalize
         )
@@ -188,6 +255,11 @@ def inner_edges_layer(
 
     # hard threshold → flat black lines, no photographic gradient
     _, edges = cv2.threshold(edges, binarize_threshold, 255, cv2.THRESH_BINARY)
+
+    # optional: close small gaps to keep strokes continuous after pruning
+    if inner_close > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_close * 2 + 1,) * 2)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k)
 
     # restrict to interior of subject (avoid double-drawing outer edge)
     _, mask_bin = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
@@ -234,12 +306,25 @@ def composite_rgba(outer: np.ndarray, inner: np.ndarray, background: str) -> np.
     raise ValueError(f"unknown background: {background}")
 
 
+# --detail-level maps to a tuple of overrides applied on top of defaults.
+# All non-outline tiers run the same LineartDetector and step the binarize
+# threshold + component-size pruning + post-close to drop progressively more
+# fine detail. Using one model gives a clean visual progression across tiers.
+_DETAIL_PRESETS: dict[str, dict] = {
+    "detailed": dict(style="lineart",       binarize_threshold=20,  min_component_size=4,   inner_close=0),
+    "medium":   dict(style="lineart",       binarize_threshold=50,  min_component_size=25,  inner_close=1),
+    "simple":   dict(style="lineart-anime", binarize_threshold=30,  min_component_size=30,  inner_close=0),
+    "minimal":  dict(style="lineart-anime", binarize_threshold=80,  min_component_size=120, inner_close=0),
+    "outline":  dict(no_inner=True),
+}
+
+
 def extract_contour(
     input_path: Path,
     output_path: Path,
     *,
     model: str = "u2net",
-    style: str = "canny",
+    style: str = "lineart",
     background: str = "transparent",
     outer_thickness: int = 1,
     inner_thickness: int = 1,
@@ -251,6 +336,8 @@ def extract_contour(
     xdog_epsilon: float = 0.005,
     xdog_phi: float = 20.0,
     xdog_normalize: bool = True,
+    lineart_coarse: bool = False,
+    lineart_resolution: int = 512,
     binarize_threshold: int = 20,
     clahe_clip: float = 2.0,
     bilateral_strength: int = 40,
@@ -258,6 +345,7 @@ def extract_contour(
     smooth: int = 1,
     erode: int = 2,
     min_component_size: int = 4,
+    inner_close: int = 0,
     alpha_matting: bool = False,
     mask_close: int = 4,
     mask_open: int = 2,
@@ -281,6 +369,8 @@ def extract_contour(
             xdog_epsilon=xdog_epsilon,
             xdog_phi=xdog_phi,
             xdog_normalize=xdog_normalize,
+            lineart_coarse=lineart_coarse,
+            lineart_resolution=lineart_resolution,
             binarize_threshold=binarize_threshold,
             clahe_clip=clahe_clip,
             bilateral_strength=bilateral_strength,
@@ -288,6 +378,7 @@ def extract_contour(
             thickness=inner_thickness,
             erode=erode,
             min_component_size=min_component_size,
+            inner_close=inner_close,
         )
     rgba = composite_rgba(outer, inner, background)
     Image.fromarray(rgba, mode="RGBA").save(str(output_path), format="PNG")
@@ -307,9 +398,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--style",
-        default="canny",
-        choices=["canny", "sketch"],
-        help="inner edge style: 'canny' (uniform thin lines, default) or 'sketch' (XDoG, denser)",
+        default="lineart",
+        choices=["lineart", "lineart-anime", "canny", "sketch"],
+        help="inner edge style: 'lineart' (neural, default, artist-like strokes), "
+             "'lineart-anime' (cleaner/simpler), 'canny' (classic), 'sketch' (XDoG)",
+    )
+    p.add_argument(
+        "--detail-level",
+        default=None,
+        choices=list(_DETAIL_PRESETS.keys()),
+        help="preset that overrides --style and density flags. Tiers: "
+             "detailed | medium | simple | minimal | outline",
+    )
+    p.add_argument(
+        "--lineart-resolution",
+        type=int,
+        default=512,
+        help="working resolution for the neural line-art model (256/512/768). Higher = finer detail, slower",
+    )
+    p.add_argument(
+        "--lineart-coarse",
+        action="store_true",
+        help="LineartDetector coarse mode (only used with --style lineart)",
     )
     p.add_argument(
         "--background",
@@ -342,6 +452,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="drop connected stroke components smaller than this many pixels (0 = keep all)",
+    )
+    p.add_argument(
+        "--inner-close",
+        type=int,
+        default=0,
+        help="morphological close radius on inner edges (reconnects gaps in simpler tiers)",
     )
     p.add_argument("--clahe-clip", type=float, default=2.0, help="CLAHE clip limit (0 = disable)")
     p.add_argument(
@@ -379,12 +495,22 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _apply_detail_preset(args: argparse.Namespace) -> None:
+    """Overwrite individual flags with the chosen --detail-level preset."""
+    if not args.detail_level:
+        return
+    preset = _DETAIL_PRESETS[args.detail_level]
+    for key, val in preset.items():
+        setattr(args, key, val)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.input.exists():
         print(f"error: input not found: {args.input}", file=sys.stderr)
         return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    _apply_detail_preset(args)
 
     extract_contour(
         args.input,
@@ -402,7 +528,10 @@ def main(argv: list[str] | None = None) -> int:
         xdog_epsilon=args.xdog_epsilon,
         xdog_phi=args.xdog_phi,
         xdog_normalize=not args.no_xdog_normalize,
+        lineart_coarse=args.lineart_coarse,
+        lineart_resolution=args.lineart_resolution,
         binarize_threshold=args.binarize_threshold,
+        inner_close=args.inner_close,
         clahe_clip=args.clahe_clip,
         bilateral_strength=args.bilateral_strength,
         flatten=args.flatten,
