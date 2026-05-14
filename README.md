@@ -1,14 +1,16 @@
 # contour-extractor
 
-CLI tool: photo with a person or animal in the foreground → transparent (or white) PNG with a pencil-sketch outline plus inner detail strokes.
+CLI tool: photo with a person or animal in the foreground → clean line-art PNG with a uniform black outline plus inner detail strokes. Transparent or opaque white background.
 
 ## Pipeline
 
 1. **`rembg`** (U2Net / ISNet) → alpha mask of the foreground subject
-2. **`cv2.findContours`** on the mask → outer silhouette (thick stroke)
-3. **XDoG** (Extended Difference of Gaussians, default) or **Canny** edges on the masked subject → pencil-style inner strokes, restricted to the subject's interior (mask erosion avoids double-drawing the rim)
-4. Optional per-image **min-max normalization** + **gamma** post-process push faint strokes up so low-contrast subjects (white fur, soft studio light) still produce visible inner detail
-5. Composite both layers into an RGBA PNG: black strokes on transparent or opaque white background
+2. **Mask refinement** — morphological close (fill holes) + open (remove specks)
+3. **`cv2.findContours`** on the refined mask → outer silhouette as a single uniform black line
+4. **`cv2.pyrMeanShiftFiltering`** on the original image → flattens fabric, fur and skin texture into uniform regions
+5. **Canny edges** (default) or **XDoG** on the flattened image → inner detail lines
+6. Hard threshold + small-component pruning → no gradients, no noise specks
+7. Composite as RGBA PNG, black strokes on transparent or opaque white
 
 ## Setup
 
@@ -21,7 +23,7 @@ uv venv --python 3.12
 uv pip install -r requirements.txt
 ```
 
-First run downloads the rembg model (~170 MB) to `~/.u2net/`.
+First run downloads a rembg model (~170 MB) to `~/.u2net/`.
 
 ## Usage
 
@@ -32,23 +34,26 @@ First run downloads the rembg model (~170 MB) to `~/.u2net/`.
 ### Recipes
 
 ```bash
-# default — XDoG sketch style, transparent background, human subject
+# default — Canny line-art, transparent background, human subject
 .venv/bin/python contour.py photo.jpg out.png --model u2net_human_seg
 
-# white background (opaque white, ready to print or use directly)
+# opaque white background (ready for print or colouring)
 .venv/bin/python contour.py photo.jpg sketch.png --model u2net_human_seg --background white
 
 # animal photo
 .venv/bin/python contour.py cat.jpg cat_line.png --model isnet-general-use
 
+# very textured fabric (cable-knit, dense pattern) — push flattening up
+.venv/bin/python contour.py photo.jpg out.png --model u2net_human_seg --flatten 50 --min-component-size 80
+
 # silhouette only (no inner detail)
 .venv/bin/python contour.py photo.jpg sil.png --no-inner --outer-thickness 6
 
-# bolder strokes
-.venv/bin/python contour.py photo.jpg bold.png --model u2net_human_seg --inner-thickness 2 --gamma 0.5
+# XDoG pencil-sketch style instead of clean line-art
+.venv/bin/python contour.py photo.jpg sketch.png --style sketch
 
-# classic Canny edges instead of XDoG sketch
-.venv/bin/python contour.py photo.jpg edges.png --style canny --canny-low 40 --canny-high 120
+# fuzzy subject (lots of hair/fur) — enable alpha matting for sharper edge
+.venv/bin/python contour.py portrait.jpg out.png --model u2net_human_seg --alpha-matting
 ```
 
 ### Batch over a folder
@@ -57,56 +62,56 @@ First run downloads the rembg model (~170 MB) to `~/.u2net/`.
 ./batch.sh
 ```
 
-Reads `examples/test/*.jpg`, writes `examples/test_out/<name>_transparent.png` and `<name>_white.png`. Auto-selects the rembg model from the filename (`*portrait*` → `u2net_human_seg`, otherwise `isnet-general-use`).
+Reads `examples/test/*.jpg`, writes both transparent and white versions to `examples/test_out/`. Auto-selects the rembg model from the filename (`*portrait*` → `u2net_human_seg`, otherwise `isnet-general-use`).
 
 ## Options
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--model` | `u2net` | `u2net_human_seg` for humans, `isnet-general-use` strong all-rounder, `silueta` lightest |
-| `--style` | `sketch` | `sketch` (XDoG pencil strokes) or `canny` (sharp edges) |
+| `--model` | `u2net` | `u2net_human_seg` for humans, `isnet-general-use` strong all-rounder |
+| `--style` | `canny` | `canny` (clean line-art) or `sketch` (XDoG pencil strokes) |
 | `--background` | `transparent` | `transparent` or `white` |
 | `--outer-thickness` | `4` | silhouette line width px |
-| `--inner-thickness` | `1` | inner edge dilation px (1 = thin, 2-3 = bold) |
-| `--xdog-sigma` | `0.8` | XDoG base sigma — smaller = finer detail |
-| `--xdog-k` | `1.6` | ratio of second sigma — typ. 1.4–2.0 |
-| `--xdog-tau` | `0.99` | second Gaussian weight (closer to 1 = thinner strokes) |
-| `--xdog-epsilon` | `0.005` | XDoG threshold — higher = more strokes |
-| `--xdog-phi` | `20.0` | edge sharpness — higher = harder edges |
-| `--no-xdog-normalize` | off | disable per-image min-max rescaling (keeps relative stroke strength across photos) |
-| `--gamma` | `0.7` | post-process gamma on inner edges (<1 boosts faint strokes, 1.0 = off) |
-| `--canny-low` | `60` | Canny lower threshold (only for `--style canny`) |
-| `--canny-high` | `160` | Canny upper threshold |
-| `--clahe-clip` | `3.5` | local contrast boost before edge detection (0 = off) |
-| `--smooth` | `1` | Gaussian blur radius on mask before contour |
-| `--erode` | `3` | shrink mask before inner edges, avoids double-drawing the rim |
+| `--inner-thickness` | `1` | inner edge dilation px |
+| `--canny-low` | `80` | Canny lower threshold |
+| `--canny-high` | `200` | Canny upper threshold |
+| `--flatten` | `30` | `pyrMeanShift` texture-flattening strength (0 = off; 50+ for heavy texture) |
+| `--bilateral-strength` | `80` | final smoothing pass strength |
+| `--clahe-clip` | `2.0` | local contrast boost (0 = off) |
+| `--binarize-threshold` | `35` | inner-edge threshold (0–255) |
+| `--min-component-size` | `40` | drop stroke components smaller than N pixels |
+| `--smooth` | `2` | Gaussian blur radius on the mask before contour |
+| `--erode` | `3` | shrink mask before inner edges to skip the rim |
+| `--alpha-matting` | off | sharper fur/hair contour (slower, can pick up background blobs on cluttered photos) |
+| `--mask-close` | `4` | morphological close radius on the mask |
+| `--mask-open` | `2` | morphological open radius on the mask |
 | `--no-inner` | off | silhouette only |
 
-## Tuning
+## Tuning cheatsheet
 
-- **Lines too pale** → lower `--gamma` (e.g. `0.5`) or raise `--inner-thickness` to `2`
-- **Output too dark / too dense** → raise `--gamma` (e.g. `0.9`) or raise `--xdog-epsilon`
+- **Output has speckled fabric / wool / skin texture noise** → raise `--flatten` (e.g. `50`) and `--min-component-size` (e.g. `80`)
+- **Output too empty / missing facial features** → lower `--canny-low` (e.g. `50`) or `--min-component-size` (e.g. `15`)
+- **Outer contour ragged on fuzzy subjects (hair, fur)** → enable `--alpha-matting`
 - **Silhouette jagged** → raise `--smooth` (e.g. `3`)
-- **Subject mis-detected** → pick a different `--model` (try `isnet-general-use` first, fall back to `silueta` for fast or unusual subjects)
-- **Rim doubled** → raise `--erode` (e.g. `5`)
-- **Subject has lots of fine texture you want to skip** → raise `--xdog-sigma` (e.g. `1.2`)
+- **Wrong subject detected** → try `--model isnet-general-use` (general) or `--model silueta` (lightweight)
+- **Mask has small holes / detached blobs** → raise `--mask-close` / `--mask-open` (e.g. `6` / `4`)
 
 ## Test set
 
-`examples/test/urls.txt` lists 15 [Unsplash](https://unsplash.com) photos (5 portraits, 3 cats, 3 dogs, 2 horses, 2 wildlife). Pull them with:
+`examples/test/urls.txt` lists 15 [Unsplash](https://unsplash.com) photos (portraits, cats, dogs, horses, wildlife). Pull and render with:
 
 ```bash
 ./scripts/fetch_test_images.sh
 ./batch.sh
 ```
 
-Renderings in `examples/test_out/`. Used under the [Unsplash License](https://unsplash.com/license) (free, no attribution required).
+Rendered showcase outputs are committed to `examples/test_out/`. Photos used under the [Unsplash License](https://unsplash.com/license).
 
 ## Repo layout
 
 ```
 contour.py                    main CLI
-batch.sh                      batch script over examples/test/
+batch.sh                      batch driver over examples/test/
 requirements.txt              Python deps
 scripts/fetch_test_images.sh  download the 15-image Unsplash test set
 examples/test/urls.txt        source URLs

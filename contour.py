@@ -26,14 +26,50 @@ def load_image_bgr(path: Path) -> np.ndarray:
     return img
 
 
-def foreground_mask(img_bgr: np.ndarray, model: str) -> np.ndarray:
-    """Run rembg and return uint8 alpha mask (0..255)."""
+def foreground_mask(
+    img_bgr: np.ndarray,
+    model: str,
+    alpha_matting: bool = True,
+    matting_fg_threshold: int = 240,
+    matting_bg_threshold: int = 10,
+    matting_erode_size: int = 10,
+) -> np.ndarray:
+    """Run rembg and return uint8 alpha mask (0..255).
+
+    When `alpha_matting` is True, rembg runs an additional pymatting-based
+    refinement that produces sharper boundaries at fur, hair, fabric edges.
+    Slower (~3–5× the base model) but markedly better contour quality.
+    """
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     session = new_session(model)
-    cutout = remove(pil, session=session)
+    if alpha_matting:
+        cutout = remove(
+            pil,
+            session=session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=matting_fg_threshold,
+            alpha_matting_background_threshold=matting_bg_threshold,
+            alpha_matting_erode_size=matting_erode_size,
+        )
+    else:
+        cutout = remove(pil, session=session)
     rgba = np.array(cutout.convert("RGBA"))
     return rgba[:, :, 3]
+
+
+def refine_mask(mask: np.ndarray, close_radius: int, open_radius: int) -> np.ndarray:
+    """Morphological refinement: close fills small interior holes; open removes
+    small detached artifacts. Operates on a thresholded binary copy and returns
+    the refined alpha (0/255)."""
+    _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    if close_radius > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_radius * 2 + 1,) * 2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
+    if open_radius > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_radius * 2 + 1,) * 2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
+    return binary
 
 
 def outer_contour_layer(mask: np.ndarray, thickness: int, smooth: int) -> np.ndarray:
@@ -43,24 +79,36 @@ def outer_contour_layer(mask: np.ndarray, thickness: int, smooth: int) -> np.nda
         k = smooth * 2 + 1
         m = cv2.GaussianBlur(m, (k, k), 0)
     _, binary = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
-
-    # close small holes so contour is one clean curve
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     layer = np.zeros_like(mask, dtype=np.uint8)
     cv2.drawContours(layer, contours, -1, color=255, thickness=thickness, lineType=cv2.LINE_AA)
     return layer
 
 
-def _preprocess_gray(img_bgr: np.ndarray, clahe_clip: float) -> np.ndarray:
-    """Grayscale + local contrast (CLAHE) + edge-preserving smoothing."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+def _preprocess_gray(
+    img_bgr: np.ndarray,
+    clahe_clip: float,
+    bilateral_strength: int,
+    flatten: int,
+) -> np.ndarray:
+    """Grayscale with aggressive texture flattening so only structural edges survive.
+
+    `flatten` controls pyrMeanShift filtering strength: it merges nearby pixels with
+    similar colors into uniform regions, killing fabric/skin/fur micro-texture
+    before edge detection. 0 disables it (faster, but textures leak through).
+    `bilateral_strength` does a final edge-preserving smoothing pass.
+    """
+    src = img_bgr
+    if flatten > 0:
+        # pyrMeanShift flattens texture; sp = spatial radius, sr = color radius
+        src = cv2.pyrMeanShiftFiltering(src, sp=max(6, flatten // 2), sr=flatten)
+
+    gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
     if clahe_clip > 0:
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
-    return cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
+    sigma = max(10, bilateral_strength)
+    return cv2.bilateralFilter(gray, d=9, sigmaColor=sigma, sigmaSpace=sigma)
 
 
 def _canny_edges(gray: np.ndarray, low: int, high: int) -> np.ndarray:
@@ -115,13 +163,19 @@ def inner_edges_layer(
     xdog_epsilon: float,
     xdog_phi: float,
     xdog_normalize: bool,
-    gamma: float,
+    binarize_threshold: int,
     clahe_clip: float,
+    bilateral_strength: int,
+    flatten: int,
     thickness: int,
     erode: int,
+    min_component_size: int,
 ) -> np.ndarray:
-    """Return uint8 single-channel edge image inside the foreground only."""
-    gray = _preprocess_gray(img_bgr, clahe_clip)
+    """Return uint8 binary edge image inside the foreground only.
+
+    Output is hard-thresholded: 0 (background) or 255 (stroke). No gradients.
+    """
+    gray = _preprocess_gray(img_bgr, clahe_clip, bilateral_strength, flatten)
 
     if style == "canny":
         edges = _canny_edges(gray, canny_low, canny_high)
@@ -132,18 +186,24 @@ def inner_edges_layer(
     else:
         raise ValueError(f"unknown style: {style}")
 
-    # gamma post-process: gamma<1 boosts faint strokes (darker output), >1 fades them
-    if gamma > 0 and abs(gamma - 1.0) > 1e-3:
-        norm = edges.astype(np.float32) / 255.0
-        norm = np.power(norm, gamma)
-        edges = (norm * 255.0).astype(np.uint8)
+    # hard threshold → flat black lines, no photographic gradient
+    _, edges = cv2.threshold(edges, binarize_threshold, 255, cv2.THRESH_BINARY)
 
     # restrict to interior of subject (avoid double-drawing outer edge)
-    _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    _, mask_bin = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
     if erode > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode * 2 + 1, erode * 2 + 1))
-        binary = cv2.erode(binary, kernel)
-    edges = cv2.bitwise_and(edges, edges, mask=binary)
+        mask_bin = cv2.erode(mask_bin, kernel)
+    edges = cv2.bitwise_and(edges, edges, mask=mask_bin)
+
+    # drop tiny isolated specks (texture noise, jpeg artifacts)
+    if min_component_size > 0:
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+        keep = np.zeros_like(edges)
+        for i in range(1, n_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= min_component_size:
+                keep[labels == i] = 255
+        edges = keep
 
     if thickness > 1:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thickness, thickness))
@@ -152,19 +212,23 @@ def inner_edges_layer(
 
 
 def composite_rgba(outer: np.ndarray, inner: np.ndarray, background: str) -> np.ndarray:
-    """Black lines combined. background = 'transparent' or 'white'."""
+    """Combine outer + inner into hard-edged black lines.
+
+    Inner is already binary (0/255). Outer was anti-aliased — binarize it here
+    so the whole output is a single flat tone of black on transparent or white.
+    """
     h, w = outer.shape
-    combined = cv2.max(outer, inner)  # 0..255 line strength
+    _, outer_bin = cv2.threshold(outer, 127, 255, cv2.THRESH_BINARY)
+    combined = cv2.max(outer_bin, inner)
 
     if background == "transparent":
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[:, :, 3] = combined  # alpha = line strength, RGB stays 0 (black)
+        rgba[:, :, 3] = combined  # alpha = 0 or 255 only — flat black strokes
         return rgba
     if background == "white":
-        # black strokes (line strength → darkness) on opaque white
-        line = combined.astype(np.float32) / 255.0
-        rgb = np.full((h, w, 3), 255, dtype=np.uint8)
-        rgb = (rgb.astype(np.float32) * (1.0 - line[..., None])).astype(np.uint8)
+        line = (combined > 0).astype(np.uint8)
+        rgb = np.where(line[..., None] == 1, 0, 255).astype(np.uint8)
+        rgb = np.repeat(rgb, 3, axis=2)
         rgba = np.dstack([rgb, np.full((h, w), 255, dtype=np.uint8)])
         return rgba
     raise ValueError(f"unknown background: {background}")
@@ -175,25 +239,32 @@ def extract_contour(
     output_path: Path,
     *,
     model: str = "u2net",
-    style: str = "sketch",
+    style: str = "canny",
     background: str = "transparent",
     outer_thickness: int = 4,
     inner_thickness: int = 1,
-    canny_low: int = 60,
-    canny_high: int = 160,
+    canny_low: int = 80,
+    canny_high: int = 200,
     xdog_sigma: float = 0.8,
     xdog_k: float = 1.6,
     xdog_tau: float = 0.99,
     xdog_epsilon: float = 0.005,
     xdog_phi: float = 20.0,
     xdog_normalize: bool = True,
-    gamma: float = 0.7,
-    clahe_clip: float = 3.5,
-    smooth: int = 1,
+    binarize_threshold: int = 35,
+    clahe_clip: float = 2.0,
+    bilateral_strength: int = 80,
+    flatten: int = 30,
+    smooth: int = 2,
     erode: int = 3,
+    min_component_size: int = 40,
+    alpha_matting: bool = False,
+    mask_close: int = 4,
+    mask_open: int = 2,
 ) -> None:
     img = load_image_bgr(input_path)
-    mask = foreground_mask(img, model)
+    mask = foreground_mask(img, model, alpha_matting=alpha_matting)
+    mask = refine_mask(mask, close_radius=mask_close, open_radius=mask_open)
     outer = outer_contour_layer(mask, outer_thickness, smooth)
     if inner_thickness <= 0:
         inner = np.zeros_like(mask, dtype=np.uint8)
@@ -210,10 +281,13 @@ def extract_contour(
             xdog_epsilon=xdog_epsilon,
             xdog_phi=xdog_phi,
             xdog_normalize=xdog_normalize,
-            gamma=gamma,
+            binarize_threshold=binarize_threshold,
             clahe_clip=clahe_clip,
+            bilateral_strength=bilateral_strength,
+            flatten=flatten,
             thickness=inner_thickness,
             erode=erode,
+            min_component_size=min_component_size,
         )
     rgba = composite_rgba(outer, inner, background)
     Image.fromarray(rgba, mode="RGBA").save(str(output_path), format="PNG")
@@ -233,9 +307,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--style",
-        default="sketch",
-        choices=["sketch", "canny"],
-        help="inner edge style: 'sketch' (XDoG, pencil-style strokes) or 'canny' (sharp edges)",
+        default="canny",
+        choices=["canny", "sketch"],
+        help="inner edge style: 'canny' (clean line-art, default) or 'sketch' (XDoG pencil strokes)",
     )
     p.add_argument(
         "--background",
@@ -245,8 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--outer-thickness", type=int, default=4, help="silhouette line width px")
     p.add_argument("--inner-thickness", type=int, default=1, help="inner edge line width px")
-    p.add_argument("--canny-low", type=int, default=60, help="Canny lower threshold (canny style)")
-    p.add_argument("--canny-high", type=int, default=160, help="Canny upper threshold (canny style)")
+    p.add_argument("--canny-low", type=int, default=80, help="Canny lower threshold (canny style)")
+    p.add_argument("--canny-high", type=int, default=200, help="Canny upper threshold (canny style)")
     p.add_argument("--xdog-sigma", type=float, default=0.8, help="XDoG base sigma — smaller = finer detail")
     p.add_argument("--xdog-k", type=float, default=1.6, help="XDoG sigma ratio (typ. 1.4 – 2.0)")
     p.add_argument("--xdog-tau", type=float, default=0.99, help="XDoG second Gaussian weight (closer to 1 = thinner strokes)")
@@ -258,14 +332,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable per-image min-max normalization on XDoG output",
     )
     p.add_argument(
-        "--gamma",
-        type=float,
-        default=0.7,
-        help="post-process gamma on inner edges (<1 boosts faint strokes, >1 fades, 1 = off)",
+        "--binarize-threshold",
+        type=int,
+        default=35,
+        help="threshold for inner edges (0–255). Lower = more strokes kept",
     )
-    p.add_argument("--clahe-clip", type=float, default=3.5, help="CLAHE clip limit (0 = disable)")
-    p.add_argument("--smooth", type=int, default=1, help="mask Gaussian blur radius (0 = off)")
+    p.add_argument(
+        "--min-component-size",
+        type=int,
+        default=40,
+        help="drop connected stroke components smaller than this many pixels (0 = keep all)",
+    )
+    p.add_argument("--clahe-clip", type=float, default=2.0, help="CLAHE clip limit (0 = disable)")
+    p.add_argument(
+        "--bilateral-strength",
+        type=int,
+        default=80,
+        help="bilateral filter strength on grayscale (higher = washes out skin/fabric texture)",
+    )
+    p.add_argument(
+        "--flatten",
+        type=int,
+        default=30,
+        help="pyrMeanShift texture-flattening strength (0 = off, 20–40 typical, higher kills more texture)",
+    )
+    p.add_argument("--smooth", type=int, default=2, help="mask Gaussian blur radius (0 = off)")
     p.add_argument("--erode", type=int, default=3, help="erode mask before inner edges to skip rim")
+    p.add_argument(
+        "--alpha-matting",
+        action="store_true",
+        help="enable rembg alpha matting for sharper fur/hair contour (slower, can include background blobs on cluttered photos)",
+    )
+    p.add_argument(
+        "--mask-close",
+        type=int,
+        default=4,
+        help="morphological close radius on the mask (fills small interior holes)",
+    )
+    p.add_argument(
+        "--mask-open",
+        type=int,
+        default=2,
+        help="morphological open radius on the mask (removes detached specks)",
+    )
     p.add_argument("--no-inner", action="store_true", help="silhouette only, skip inner edges")
     return p
 
@@ -293,10 +402,16 @@ def main(argv: list[str] | None = None) -> int:
         xdog_epsilon=args.xdog_epsilon,
         xdog_phi=args.xdog_phi,
         xdog_normalize=not args.no_xdog_normalize,
-        gamma=args.gamma,
+        binarize_threshold=args.binarize_threshold,
         clahe_clip=args.clahe_clip,
+        bilateral_strength=args.bilateral_strength,
+        flatten=args.flatten,
         smooth=args.smooth,
         erode=args.erode,
+        min_component_size=args.min_component_size,
+        alpha_matting=args.alpha_matting,
+        mask_close=args.mask_close,
+        mask_open=args.mask_open,
     )
     print(f"wrote: {args.output}")
     return 0
