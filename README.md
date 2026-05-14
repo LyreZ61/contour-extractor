@@ -71,17 +71,17 @@ Reads `examples/test/*.jpg`, writes both transparent and white versions to `exam
 | `--model` | `u2net` | `u2net_human_seg` for humans, `isnet-general-use` strong all-rounder |
 | `--style` | `canny` | `canny` (clean line-art) or `sketch` (XDoG pencil strokes) |
 | `--background` | `transparent` | `transparent` or `white` |
-| `--outer-thickness` | `4` | silhouette line width px |
+| `--outer-thickness` | `1` | silhouette line width px (match `--inner-thickness` for uniform stroke) |
 | `--inner-thickness` | `1` | inner edge dilation px |
-| `--canny-low` | `80` | Canny lower threshold |
-| `--canny-high` | `200` | Canny upper threshold |
-| `--flatten` | `30` | `pyrMeanShift` texture-flattening strength (0 = off; 50+ for heavy texture) |
-| `--bilateral-strength` | `80` | final smoothing pass strength |
+| `--canny-low` | `30` | Canny lower threshold |
+| `--canny-high` | `80` | Canny upper threshold |
+| `--flatten` | `0` | `pyrMeanShift` texture-flattening strength (0 = off, keeps detail; 30–50 to wash out fabric) |
+| `--bilateral-strength` | `40` | final smoothing pass strength |
 | `--clahe-clip` | `2.0` | local contrast boost (0 = off) |
-| `--binarize-threshold` | `35` | inner-edge threshold (0–255) |
-| `--min-component-size` | `40` | drop stroke components smaller than N pixels |
-| `--smooth` | `2` | Gaussian blur radius on the mask before contour |
-| `--erode` | `3` | shrink mask before inner edges to skip the rim |
+| `--binarize-threshold` | `20` | inner-edge threshold (0–255) |
+| `--min-component-size` | `4` | drop stroke components smaller than N pixels |
+| `--smooth` | `1` | Gaussian blur radius on the mask before contour |
+| `--erode` | `2` | shrink mask before inner edges to skip the rim |
 | `--alpha-matting` | off | sharper fur/hair contour (slower, can pick up background blobs on cluttered photos) |
 | `--mask-close` | `4` | morphological close radius on the mask |
 | `--mask-open` | `2` | morphological open radius on the mask |
@@ -89,12 +89,15 @@ Reads `examples/test/*.jpg`, writes both transparent and white versions to `exam
 
 ## Tuning cheatsheet
 
-- **Output has speckled fabric / wool / skin texture noise** → raise `--flatten` (e.g. `50`) and `--min-component-size` (e.g. `80`)
-- **Output too empty / missing facial features** → lower `--canny-low` (e.g. `50`) or `--min-component-size` (e.g. `15`)
+- **Want thicker lines** → raise both `--outer-thickness` and `--inner-thickness` together (e.g. `2 2`); keep them equal so strokes stay uniform
+- **Output too dense / cluttered** → raise `--canny-low` (e.g. `60`) and `--canny-high` (e.g. `150`), or raise `--flatten` (e.g. `30`) to wash texture
+- **Output too sparse / missing detail** → lower `--canny-low` (e.g. `15`) and `--canny-high` (e.g. `50`)
+- **Speckled fabric / wool noise** → raise `--flatten` (e.g. `50`) and `--min-component-size` (e.g. `40`)
 - **Outer contour ragged on fuzzy subjects (hair, fur)** → enable `--alpha-matting`
 - **Silhouette jagged** → raise `--smooth` (e.g. `3`)
 - **Wrong subject detected** → try `--model isnet-general-use` (general) or `--model silueta` (lightweight)
 - **Mask has small holes / detached blobs** → raise `--mask-close` / `--mask-open` (e.g. `6` / `4`)
+- **Want pencil-sketch style instead of clean line-art** → `--style sketch`
 
 ## Test set
 

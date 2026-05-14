@@ -241,23 +241,23 @@ def extract_contour(
     model: str = "u2net",
     style: str = "canny",
     background: str = "transparent",
-    outer_thickness: int = 4,
+    outer_thickness: int = 1,
     inner_thickness: int = 1,
-    canny_low: int = 80,
-    canny_high: int = 200,
+    canny_low: int = 30,
+    canny_high: int = 80,
     xdog_sigma: float = 0.8,
     xdog_k: float = 1.6,
     xdog_tau: float = 0.99,
     xdog_epsilon: float = 0.005,
     xdog_phi: float = 20.0,
     xdog_normalize: bool = True,
-    binarize_threshold: int = 35,
+    binarize_threshold: int = 20,
     clahe_clip: float = 2.0,
-    bilateral_strength: int = 80,
-    flatten: int = 30,
-    smooth: int = 2,
-    erode: int = 3,
-    min_component_size: int = 40,
+    bilateral_strength: int = 40,
+    flatten: int = 0,
+    smooth: int = 1,
+    erode: int = 2,
+    min_component_size: int = 4,
     alpha_matting: bool = False,
     mask_close: int = 4,
     mask_open: int = 2,
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--style",
         default="canny",
         choices=["canny", "sketch"],
-        help="inner edge style: 'canny' (clean line-art, default) or 'sketch' (XDoG pencil strokes)",
+        help="inner edge style: 'canny' (uniform thin lines, default) or 'sketch' (XDoG, denser)",
     )
     p.add_argument(
         "--background",
@@ -317,10 +317,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["transparent", "white"],
         help="output background",
     )
-    p.add_argument("--outer-thickness", type=int, default=4, help="silhouette line width px")
-    p.add_argument("--inner-thickness", type=int, default=1, help="inner edge line width px")
-    p.add_argument("--canny-low", type=int, default=80, help="Canny lower threshold (canny style)")
-    p.add_argument("--canny-high", type=int, default=200, help="Canny upper threshold (canny style)")
+    p.add_argument("--outer-thickness", type=int, default=1, help="silhouette line width px (match inner for uniform stroke)")
+    p.add_argument("--inner-thickness", type=int, default=1, help="inner edge dilation px (1 = thin uniform stroke)")
+    p.add_argument("--canny-low", type=int, default=30, help="Canny lower threshold (canny style)")
+    p.add_argument("--canny-high", type=int, default=80, help="Canny upper threshold (canny style)")
     p.add_argument("--xdog-sigma", type=float, default=0.8, help="XDoG base sigma — smaller = finer detail")
     p.add_argument("--xdog-k", type=float, default=1.6, help="XDoG sigma ratio (typ. 1.4 – 2.0)")
     p.add_argument("--xdog-tau", type=float, default=0.99, help="XDoG second Gaussian weight (closer to 1 = thinner strokes)")
@@ -334,30 +334,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--binarize-threshold",
         type=int,
-        default=35,
+        default=20,
         help="threshold for inner edges (0–255). Lower = more strokes kept",
     )
     p.add_argument(
         "--min-component-size",
         type=int,
-        default=40,
+        default=4,
         help="drop connected stroke components smaller than this many pixels (0 = keep all)",
     )
     p.add_argument("--clahe-clip", type=float, default=2.0, help="CLAHE clip limit (0 = disable)")
     p.add_argument(
         "--bilateral-strength",
         type=int,
-        default=80,
-        help="bilateral filter strength on grayscale (higher = washes out skin/fabric texture)",
+        default=40,
+        help="bilateral filter strength on grayscale (higher washes out micro-texture)",
     )
     p.add_argument(
         "--flatten",
         type=int,
-        default=30,
-        help="pyrMeanShift texture-flattening strength (0 = off, 20–40 typical, higher kills more texture)",
+        default=0,
+        help="pyrMeanShift texture-flattening strength (0 = off keeps all detail; 30–50 to wash out fabric)",
     )
-    p.add_argument("--smooth", type=int, default=2, help="mask Gaussian blur radius (0 = off)")
-    p.add_argument("--erode", type=int, default=3, help="erode mask before inner edges to skip rim")
+    p.add_argument("--smooth", type=int, default=1, help="mask Gaussian blur radius (0 = off)")
+    p.add_argument("--erode", type=int, default=2, help="erode mask before inner edges to skip rim")
     p.add_argument(
         "--alpha-matting",
         action="store_true",
