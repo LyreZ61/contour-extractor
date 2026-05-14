@@ -16,6 +16,7 @@ examples/21aa606f-d350-4f13-ac13-34e5803cfa8a.png
 examples/3ae0ad24-1c2b-4c82-b77b-e4f0f1ee9dfc.png
 examples/out_v*.png
 examples/out_final*.png
+examples/v*.png
 
 !examples/.gitkeep
 !examples/test/.gitkeep
