@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# downloaded test images (Unsplash — hotlinkable, fetch with scripts/fetch_test_images.sh)
+examples/test/*.jpg
+examples/test/*.jpeg
+examples/test/*.png
+
+# private/user-provided sample inputs (user's own photos)
+examples/*.jpg
+examples/*.jpeg
+examples/21aa606f-d350-4f13-ac13-34e5803cfa8a.png
+examples/3ae0ad24-1c2b-4c82-b77b-e4f0f1ee9dfc.png
+examples/out_v*.png
+examples/out_final*.png
+
+!examples/.gitkeep
+!examples/test/.gitkeep
+!examples/test/urls.txt
+!examples/test_out/
